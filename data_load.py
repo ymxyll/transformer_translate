@@ -1,6 +1,3 @@
-# Modify from
-# https://github.com/P3n9W31/transformer-pytorch/master/data_load.py
-
 import codecs
 # 直接open打开的话处理过程会较久，因为会经过一个unicode编码操作input --- encode --- unicode --- output
 # codecs打开则默认直接使用unicode，加快打开速度
@@ -48,15 +45,11 @@ def create_data(source_sents, target_sents):
     # Index
     x_list, y_list, Sources, Targets = [], [], [], []
     for source_sent, target_sent in zip(source_sents, target_sents):
-        x = [
-            cn2idx.get(word, 1)
-            for word in ('<S> ' + source_sent + ' </S>').split()
-        ]  # 1: OOV, </S>: End of Text
-        y = [
-            en2idx.get(word, 1)
-            for word in ('<S> ' + target_sent + ' </S>').split()
-        ]
+        # 将句子换成词典中的标号
+        x = [cn2idx.get(word, 1) for word in ('<S> ' + source_sent + ' </S>').split()]  # 1: OOV, </S>: End of Text
+        y = [en2idx.get(word, 1) for word in ('<S> ' + target_sent + ' </S>').split()]
         if max(len(x), len(y)) <= maxlen:
+            # 大于的直接丢弃
             x_list.append(np.array(x))
             y_list.append(np.array(y))
             Sources.append(source_sent)
@@ -64,15 +57,19 @@ def create_data(source_sents, target_sents):
 
     # Pad
     X = np.zeros([len(x_list), maxlen], np.int32)
+    # batch x max_len
     Y = np.zeros([len(y_list), maxlen], np.int32)
     for i, (x, y) in enumerate(zip(x_list, y_list)):
         X[i] = np.lib.pad(x, [0, maxlen - len(x)],
                           'constant',
                           constant_values=(0, 0))
+        # [0, maxlen - len(x)], 列表中第一个元素表示左侧填充的数量，第二个元素表示右侧填充的数量
+        # constant_values表示左右填充所用的值
         Y[i] = np.lib.pad(y, [0, maxlen - len(y)],
                           'constant',
                           constant_values=(0, 0))
 
+    # 得到两个numpy数组
     return X, Y, Sources, Targets
 
 
@@ -84,6 +81,7 @@ def load_data(data_type):
     assert data_type in ['train', 'test']
     cn_sents = [
         regex.sub("[^\s\p{L}']", '', line)
+        # 去除所有非字母、非空格、非单引号的字符
         for line in codecs.open(source, 'r', 'utf-8').read().split('\n')
         if line and line[0] != '<'
     ]
@@ -107,20 +105,6 @@ def load_test_data():
     return X, Y
 
 
-def get_batch_indices(total_length, batch_size):
-    assert (batch_size <=
-            total_length), ('Batch size is large than total data length.'
-                            'Check your data or change batch size.')
-    current_index = 0
-    indexs = [i for i in range(total_length)]
-    random.shuffle(indexs)
-    while 1:
-        if current_index + batch_size >= total_length:
-            break
-        current_index += batch_size
-        yield indexs[current_index:current_index + batch_size], current_index
-
-
 def idx_to_sentence(arr, vocab, insert_space=False):
     res = ''
     first_word = True
@@ -136,8 +120,13 @@ def idx_to_sentence(arr, vocab, insert_space=False):
     return res
 
 
-cn2idx, idx2cn = load_cn_vocab()
-en2idx, idx2en = load_en_vocab()
-# X: en
-# Y: cn
-Y, X = load_train_data()
+def get_batch_indices(total_length, batch_size):
+    assert (batch_size <= total_length), ('Batch size is larger than total_length')
+    current_index = 0
+    indexs = [i for i in range(total_length)]
+    random.shuffle(indexs)
+    while 1:
+        if current_index + batch_size >= total_length:
+            break
+        current_index += batch_size
+        yield indexs[current_index: current_index + batch_size], current_index

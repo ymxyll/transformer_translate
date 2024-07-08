@@ -27,19 +27,20 @@ def attention(query, key, value, mask=None, dropout=None):
 def seq_mask(q_pad, k_pad, subsequent_mask=False):
     # q_pad以及k_pad指的是pad的位置序列, shape为[n ,q_pad]
     assert q_pad.device == k_pad.device
-    n, q_len = q_pad
-    n, k_len = k_pad
-    mask_shape = (n, 1, q_len, k_len)
+    n, q_len = q_pad.shape
+    n, k_len = k_pad.shape
+    mask_shape = (n, q_len, k_len)
+    mask = torch.zeros(mask_shape)
+    mask = mask.to(q_pad.device)
+    for i in range(n):
+        mask[i, q_pad[i], :] = 1
+        mask[i, :, k_pad[i]] = 1
+    mask = mask.to(torch.bool)
+    # 若是decoder的第一个transformer块，则需要叠加
     if subsequent_mask:
-        mask = torch.tril(torch.ones(mask_shape), diagonal=1)
-        mask = (mask == 0).to(q_pad.device)
-    else:
-        mask = torch.zeros(mask_shape)
-        mask = mask.to(q_pad.device)
-        for i in range(n):
-            mask[i, :, q_pad[i], :] = 1
-            mask[i, :, :, k_pad[i]] = 1
-        mask = mask.to(torch.bool)
+        sub_mask = torch.tril(torch.ones(mask_shape), diagonal=1)
+        sub_mask = (mask == 0).to(q_pad.device)
+        mask *= sub_mask
     return mask
 
 
@@ -49,7 +50,7 @@ class MultiHeadAttention(nn.Module):
         if d_model % h_num != 0:
             print('Error!')
             return
-        self.d_h = d_model//h_num
+        self.d_model = d_model
         self.h_num = h_num
         self.proj = Layer_clone(nn.Linear(d_model, d_model), 3)
         self.linear = nn.Linear(d_model, d_model)
@@ -60,18 +61,19 @@ class MultiHeadAttention(nn.Module):
         if mask is not None:
             # 维度匹配
             mask = mask.unsqueeze(1)
-        
+        d_h = self.d_model//self.h_num
         batch = query.size(0)
+        seq_len = query.size(1)
         # projection
         query, key, value = [
-            proj(x).view(batch, -1, self.h_num, self.d_h).transpose(1, 2)
+            proj(x).view(batch, seq_len, self.h_num, d_h).transpose(1, 2)
             # --> batch, h_num, seq_len, d_h
             for proj, x in zip(self.proj, (query, key, value))
         ]
         
         attn_ans, self._attn_point = attention(query, key, value, mask, self.drop)
         # 将拆成多头的attn_ans reshape合并起来
-        attn_ans = attn_ans.transpose(1, 2).contiguous().view(batch, -1, self.d_h*self.h_num)
+        attn_ans = attn_ans.transpose(1, 2).contiguous().reshape(batch, seq_len, d_h*self.h_num)
         # transpose --> batch, seq_len, h_num, d_h
         # view --> batch, seq_len, d_model
         # contiguous使得tensor在内存中是连续的
@@ -108,7 +110,8 @@ class AddNorm(nn.Module):
     def forward(self, x, sublayer):
         # PreNorm
         # norm(x + f(norm(x)))
-        return self.norm(x + self.drop(sublayer(self.norm(x))))
+        fx = self.drop(sublayer(self.norm(x)))
+        return self.norm(x + fx)
 
 
 class TransformerLayer(nn.Module):
@@ -145,11 +148,11 @@ class PositionEncode(nn.Module):
     def forward(self, x):
         # 输入的x的shape为  b x seq_len x d_model
         b, seq_len, d_model = x.shape
-        assert seq_len <= self.pos_encode[1]
-        assert d_model == self.pos_encode[2]
+        assert seq_len <= self.pos_encode.shape[1]
+        assert d_model == self.pos_encode.shape[2]
         # 缩放word_vec x
         rescaled_x = x * math.sqrt(d_model)
-        rescaled_x = rescaled_x + self.pos_encode[:, : seq_len].requires_grad_(False)
+        x = rescaled_x + self.pos_encode[:, : seq_len].requires_grad_(False)
         # drop可选，随机丢失一部分位置编码，增加模型的健壮性
         return self.drop(x)
         
@@ -187,34 +190,34 @@ class DecoderLayer(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, layer, N) -> None:
-        super(Encoder).__init__()
+        super(Encoder, self).__init__()
         self.encoder = Layer_clone(layer, N)
-        self.norm = nn.LayerNorm(layer.shape)
+        # self.norm = nn.LayerNorm(layer.shape)
         # layer.shape是啥
         
     def forward(self, x, mask):
         # encoder需要什么mask？
         for layer in self.encoder:
             x = layer(x, mask)
-        return self.norm(x)
+        return x
 
 class Decoder(nn.Module):
     def __init__(self, layer, N) -> None:
         super(Decoder, self).__init__()
         self.decoder = Layer_clone(layer, N)
-        self.norm = nn.LayerNorm(layer.shape)
+        # self.norm = nn.LayerNorm(layer.shape)
         
     def forward(self, decoder_out, encoder_out, encoder_mask, decoder_mask):
         for layer in self.decoder:
             decoder_out = layer(decoder_out, encoder_out, encoder_mask, decoder_mask)
-        return self.norm(decoder_out)
+        return decoder_out
 
 class Transformer(nn.Module):
-    def __init__(self, src_vocab_size, tgt_vocab_size, N=6, d_model=512, d_ff=2048, h_num=8, dropout=0.1, pad_val=0) -> None:
+    def __init__(self, src_vocab_size, tgt_vocab_size, N=6, d_model=512, d_ff=2048, h_num=8, max_len=4096, dropout=0.1, pad_val=0) -> None:
         super(Transformer, self).__init__()
         self.encoder_emb = nn.Sequential(
-            nn.Linear(d_model, src_vocab_size),
-            PositionEncode(d_model, dropout))
+            nn.Embedding(src_vocab_size, d_model),
+            PositionEncode(d_model, dropout, max_len))
         self.encoder = Encoder(
             EncoderLayer(
                 d_model, 
@@ -224,8 +227,8 @@ class Transformer(nn.Module):
                 ),
             N)
         self.decoder_emb = nn.Sequential(
-            nn.Linear(d_model, tgt_vocab_size),
-            PositionEncode(d_model, dropout))
+            nn.Embedding(tgt_vocab_size, d_model),
+            PositionEncode(d_model, dropout, max_len))
         self.decoder = Decoder(
             DecoderLayer(
                 d_model,
@@ -242,24 +245,24 @@ class Transformer(nn.Module):
         self.pad_val = pad_val
         # pad的值, ==pad说明此位置上为填充
     def forward(self, encoder_input, decoder_out, encoder_mask=None, encoder_out_mask=None, decoder_out_mask=None):
+        src_pad = (encoder_input == self.pad_val)
+        tgt_pad = (decoder_out == self.pad_val)
+        if not encoder_mask:
+            encoder_mask = seq_mask(src_pad, src_pad)
+        if not (encoder_out_mask and decoder_out_mask):
+            # 有一个为空就这里定义
+            decoder_out_mask = seq_mask(tgt_pad, tgt_pad, True)
+            encoder_out_mask = seq_mask(tgt_pad, src_pad)
         encoder_out = self.encode(encoder_input, encoder_mask)
         decoder_out = self.decode(encoder_out, decoder_out, encoder_out_mask, decoder_out_mask)
         return self.out_layer(decoder_out)
         # 输出每个位置上词典中的词的概率
     
     def encode(self, encoder_input, encoder_mask=None):
-        if not encoder_mask:
-            src_pad = (encoder_input == self.pad_val)
-            encoder_mask = seq_mask(src_pad, src_pad)
-        return self.encoder(encoder_input, encoder_mask)
+        return self.encoder(self.encoder_emb(encoder_input), encoder_mask)
     
     def decode(self, encoder_out, decoder_out, encoder_out_mask, decoder_out_mask):
-        if not (encoder_out_mask and decoder_out_mask):
-            src_pad = (encoder_out == self.pad_val)
-            tgt_pad = (decoder_out == self.pad_val)
-            decoder_out_mask = seq_mask(tgt_pad, tgt_pad, True)
-            encoder_out_mask = seq_mask(tgt_pad, src_pad)
-        return self.decoder(encoder_out, decoder_out, encoder_out_mask, decoder_out_mask)
+        return self.decoder(encoder_out, self.decoder_emb(decoder_out), encoder_out_mask, decoder_out_mask)
     
 
 
